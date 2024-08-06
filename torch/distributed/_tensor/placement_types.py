@@ -476,6 +476,9 @@ class TensorMeta(NamedTuple):
     stride: Tuple[int, ...]
     dtype: torch.dtype
 
+    @staticmethod
+    def from_global_tensor(tensor: torch.Tensor) -> "TensorMeta":
+        return TensorMeta(tensor.shape, tensor.stride(), tensor.dtype)
 
 # used internally to propagate the placements
 @dataclass
@@ -708,3 +711,90 @@ class DTensorSpec:
             self.placements,
             tensor_meta=tensor_meta,
         )
+
+@dataclass
+class Partition:
+    global_shape: torch.Size
+    start_coord: Tuple[int, ...]
+    end_coord: Tuple[int, ...]
+
+    def __post_init__(self):
+        if len(self.global_shape) != len(self.start_coord) or len(self.global_shape) != len(self.end_coord):
+            raise ValueError("global_shape, start_coord and end_coord must have the same length")
+
+    def __eq__(self, other: "Partition") -> bool:
+        if self.global_shape != other.global_shape:
+            raise ValueError("global_shape of partition1 and partition2 must be the same")
+
+        return (
+            self.start_coord == other.start_coord
+            and self.end_coord == other.end_coord
+        )
+
+    def intersect_with(self, partition: "Partition") -> Optional["Partition"]:
+        return Partition.intersect(self, partition)
+
+    def __repr__(self) -> str:
+        return f"[{self.start_coord}->{self.end_coord}]"
+
+    def shard(self, dim: int, shard_num: int) -> List["Partition"]:
+        if (self.end_coord[dim] - self.start_coord[dim]) % shard_num != 0:
+            raise ValueError("shard_num must be a factor of the partition size")
+
+        res = []
+        block_size = (self.end_coord[dim] - self.start_coord[dim]) // shard_num
+        for local_start in range(self.start_coord[dim], self.end_coord[dim], block_size):
+            local_end = local_start + block_size
+            res.append(Partition(self.global_shape, self.start_coord[:dim] + (local_start,) + self.start_coord[dim + 1:], self.end_coord[:dim] + (local_end,) + self.end_coord[dim + 1:]))
+
+        return res
+
+    def intersect_with_multiple(self, partitions: List["Partition"]) -> List["Partition"]:
+        if len(partitions) == 0:
+            return []
+
+        res = []
+        for partition in partitions:
+            new_partition = self.intersect_with(partition)
+            if new_partition is not None:
+                res.append(new_partition)
+
+        return res
+
+    @staticmethod
+    def intersect(partition1: "Partition", partition2: "Partition") -> Optional["Partition"]:
+        if partition1.global_shape != partition2.global_shape:
+            raise ValueError("global_shape of partition1 and partition2 must be the same")
+
+        start_coord = tuple(max(s1, s2) for s1, s2 in zip(partition1.start_coord, partition2.start_coord))
+        end_coord = tuple(min(e1, e2) for e1, e2 in zip(partition1.end_coord, partition2.end_coord))
+
+        if any(s >= e for s, e in zip(start_coord, end_coord)):
+            return None
+
+        return Partition(partition1.global_shape, start_coord, end_coord)
+
+    @staticmethod
+    def from_tensor_spec(spec: DTensorSpec) -> Tuple["Partition"]:
+        if spec.tensor_meta is None:
+            raise ValueError("tensor_meta is not set")
+
+        global_shape, _, _ = spec.tensor_meta
+        placements = spec.placements
+
+        if any(p.is_partial() for p in placements):
+            raise ValueError("Partition does not support Partial placement")
+
+
+        shards = [cast(Shard, p) for p in placements if p.is_shard()]
+        partitions = [Partition(global_shape, (0,) * len(global_shape), tuple(global_shape))]
+
+        for device_dim, shard in enumerate(shards):
+            tensor_dim = shard.dim
+            new_partitions = []
+            for partition in partitions:
+                new_partitions.extend(partition.shard(tensor_dim, spec.mesh.size(device_dim)))
+            partitions = new_partitions
+
+        return partitions
+
