@@ -151,7 +151,7 @@ def _gen_transform_infos(
     return transform_infos
 
 
-def redistribute_local_tensor_(
+def redistribute_local_tensor(
     local_tensor: torch.Tensor,
     current_spec: DTensorSpec,
     target_spec: DTensorSpec,
@@ -211,7 +211,6 @@ def redistribute_local_tensor_(
         elif target.is_shard():
             # Case 2: target is Shard
             target_placement = cast(Shard, target)
-            target_dim = target_placement.dim
             if current.is_partial():
                 partial_spec = cast(Partial, current)
                 new_local_tensor = partial_spec._reduce_shard_value(
@@ -419,10 +418,7 @@ class Partition:
         return Partition(start_coord, end_coord, src_partition.rank)
 
     @staticmethod
-    def gen_p2p_op(rank: int, src_tensor: torch.Tensor, src_partitions: Tuple["Partition"], tgt_partitions: Tuple["Partition"]) -> Tuple[List[dist.P2POp], List[dist.P2POp], torch.Tensor, List[Tuple[slice]]]:
-        local_src_partition = src_partitions[rank]
-        local_dst_partition = tgt_partitions[rank]
-
+    def gen_recv_meta(src_partitions: Tuple["Partition"], tgt_partitions: Tuple["Partition"]) -> Dict[int, List["Partition"]]:
         recv_info = defaultdict(list)
         for tgt in tgt_partitions:
             cache = defaultdict(int)
@@ -436,12 +432,16 @@ class Partition:
                     recv_info[tgt.rank].append(intersection)
                 cache[cache_str] += 1
 
+        return recv_info
+
+    @staticmethod
+    def gen_p2p_utils(rank: int, src_tensor: torch.Tensor, local_src_partition: "Partition", local_dst_partition: "Partition", recv_meta: Dict[int, List["Partition"]]) -> Tuple[List[dist.P2POp], List[dist.P2POp], torch.Tensor, List[Tuple[slice]]]:
         send_ops = []
         recv_ops = []
         recv_slices = []
         buffer_shape = tuple(e - s for s, e in zip(local_dst_partition.start_coord, local_dst_partition.end_coord))
-        recv_buffer = torch.empty(buffer_shape, dtype=src_tensor.dtype, device=src_tensor.device) * -10086
-        for recv_rank, intersections in recv_info.items():
+        recv_buffer = torch.empty(buffer_shape, dtype=src_tensor.dtype, device=src_tensor.device)
+        for recv_rank, intersections in recv_meta.items():
             for intersection in intersections:
                 send_rank = intersection.rank
                 src_slice = tuple(slice(st - base, en - base) for base, st, en in zip(local_src_partition.start_coord, intersection.start_coord, intersection.end_coord))
@@ -478,3 +478,4 @@ class Partition:
             recv_buffer[slice] = op.tensor
 
         return recv_buffer
+
