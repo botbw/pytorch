@@ -474,6 +474,7 @@ class DTensor(torch.Tensor):
         placements: Optional[Sequence[Placement]] = None,
         *,
         async_op: bool = False,
+        p2p: bool = False,
     ) -> "DTensor":
         """
         ``redistribute`` performs necessary collective operations that redistribute the current
@@ -538,7 +539,7 @@ class DTensor(torch.Tensor):
         placements = tuple(placements)
 
         # pyre-fixme[16]: `Redistribute` has no attribute `apply`.
-        return Redistribute.apply(self, device_mesh, placements, async_op)
+        return Redistribute.apply(self, device_mesh, placements, async_op, p2p)
 
     def full_tensor(
         self, *, grad_placements: Optional[Sequence[Placement]] = None
