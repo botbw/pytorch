@@ -383,6 +383,21 @@ class Partition:
     rank: int  # rank that hold this partition
     partial_coord: Tuple[int, ...]  # partial coord of this partition
 
+    def __post_init__(self):
+        self._hash: Optional[int] = None
+
+    def _hash_impl(self) -> int:
+        return hash((self.start_coord, self.end_coord, self.rank, self.partial_coord))
+
+    def __hash__(self) -> int:
+        # We lazily cache the spec to avoid recomputing the hash upon each
+        # use, where we make sure to update the hash when the `tensor_meta`
+        # changes by overriding `__setattr__`. This must be lazy so that Dynamo
+        # does not try to hash non-singleton `SymInt`s for the stride.
+        if self._hash is None:
+            self._hash = self._hash_impl()
+        return self._hash
+
     def __repr__(self) -> str:
         return f"{{{self.start_coord}->{self.end_coord} partial {self.partial_coord} on rank{self.rank}}}"
 
@@ -440,6 +455,7 @@ class Partition:
         return Partition(start_coord, end_coord, src_partition.rank, src_partition.partial_coord)
 
     @staticmethod
+    @lru_cache(maxsize=None)
     def gen_recv_meta(src_partitions: Tuple["Partition"], tgt_partitions: Tuple["Partition"]) -> Dict[int, List["Partition"]]:
         recv_meta = defaultdict(list)
         for tgt in tgt_partitions:
