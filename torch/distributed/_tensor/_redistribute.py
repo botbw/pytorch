@@ -659,8 +659,9 @@ def _gen_immediate_transform_infos(
                     current_placements[k] = tgt
 
     # pass 3: handle all other scenarios
-    for k, tgt in enumerate(target_placements):
+    for k in range(len(current_placements) - 1, -1, -1):
         cur = current_placements[k]
+        tgt = target_placements[k]
         if cur == tgt:
             continue
 
