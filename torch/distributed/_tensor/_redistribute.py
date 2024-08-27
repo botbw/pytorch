@@ -611,7 +611,7 @@ def _gen_immediate_transform_infos(
     max_immediate_transform_cnt = 0
     best_transform_infos = []
     best_cur_placements = deepcopy(list(src_placements))
-    for seq in permutations(range(len(src_placements))):
+    for seq in permutations(range(len(src_placements)-1, -1, -1)):
         immediate_transform_cnt = 0
         cur_placements = deepcopy(list(src_placements))
         transform_infos = []
