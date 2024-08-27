@@ -1,8 +1,9 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
-import logging
 from copy import deepcopy
+import logging
 from functools import lru_cache
+from itertools import permutations
 from typing import Dict, cast, List, NamedTuple, Tuple, Optional
 from collections import defaultdict
 from dataclasses import dataclass
@@ -543,24 +544,21 @@ def _gen_immediate_transform_infos(
     dst_spec: DTensorSpec,
 ) -> Tuple[List[_TransformInfo], DTensorSpec]:
     """
-    Similar to _gen_transform_infos, but only perform simple transformation by dim if it can be 
-    achieved by one single collective operation:
+    Similar to _gen_transform_infos, but only perform simple transformation by dim if it can be achieved by one single collective operation.
+    Consider device dim k:
+        1. R -> R: No-op
+        2. R -> S(i): Safe when num of S(i) are the same in cur_spec[:k] and dst_spec[:k] and no S(i) in cur_spec[k+1:]
+        3. R -> P: Always safe
 
-    cur_spec in modified in place after following op:
-        1. From left to right:
-            a. R -> S(i) if num of S(i) are equal for cur_spec[:k] and dst_spec[:k] and no S(i) in cur_spec[k + 1:] (so that at this dim, the sharding is aligned)
-            b. P -> S(i) if satisfy P -> R (alway hold) and R -> S(i)
-        2. From right to left:
-            a. S(i) -> R if num of S(i) no S(i) in cur_spec[k + 1:]
-            b. S(i) -> P == S(i) -> R for backwards
-        3. After 2 passes:
-            a. S(i) -> S(j) if satisfy both S(i) -> R and R -> S(j) conditions
-        4. Traversal order doesn't matter:
-            a. R -> P Always available
-            b. P -> R Always available
-            c. R -> R No-op
-            d. P -> P No-op
-            e. Special P -> S(i): for those unhandled P -> S(i) cases in left-to-rifht pass, have to make it replicate since p2p doesn't support partial (possible to support)
+        4. S(i) -> R: Safe when no S(i) in cur_spec[k+1:]
+        5. S(i) -> S(j): Safe when S(i) meets 4 and S(j) meets 2
+        6. S(i) -> P: Used as S(i) -> R during backward
+
+        7. P -> R: Always safe
+        8. P -> S(i): P -> R -> S(i), safe when 7 and 2 are satisfied
+        9. P -> P: No-op
+
+        10. if P -> S(i) is not executed, do P -> R since P2P cannot handle reduce_scatter
     """
     transform_infos: List[_TransformInfo] = []
 
@@ -604,27 +602,48 @@ def _gen_immediate_transform_infos(
         else:
             mesh_dims_to_logical_shape.append(current_logical_shape)
 
-    # Next, we need to derive the transform infos from src to dst placements,
-    # here we use a greedy search with step by step state transformations
-    current_placements = list(src_spec.placements)
-    target_placements = list(dst_spec.placements)
+    tgt_placements = list(dst_spec.placements)
 
     def count_shards(placements: List[Placement], shard: Shard) -> int:
         return sum(1 for p in placements if p.is_shard(shard.dim))
 
-    # pass 1: from left to right
-    for k, tgt in enumerate(target_placements):
-        cur = current_placements[k]
-        if cur.is_replicate() or cur.is_partial():
+    src_placements = src_spec.placements
+    max_immediate_transform_cnt = 0
+    best_transform_infos = []
+    best_cur_placements = deepcopy(list(src_placements))
+    for seq in permutations(range(len(src_placements))):
+        immediate_transform_cnt = 0
+        cur_placements = deepcopy(list(src_placements))
+        transform_infos = []
+        def to_shard(k: int, tgt_shard: Shard):
+            return count_shards(cur_placements[:k], tgt_shard) == count_shards(cur_placements[:k], tgt_shard) and count_shards(cur_placements[k + 1:], tgt_shard) == 0
+
+        def from_shard(k: int, cur_shard: Shard):
+            return count_shards(cur_placements[k + 1:], cur_shard) == 0
+
+        for k in seq:
+            cur = cur_placements[k]
+            tgt = tgt_placements[k]
+
+            if cur == tgt:
+                continue
+
             if cur.is_replicate():
                 cur = cast(Replicate, cur)
-            else:
-                assert cur.is_partial()
-                cur = cast(Partial, cur)
-
-            if tgt.is_shard():
-                tgt = cast(Shard, tgt)
-                if count_shards(current_placements[:k], tgt) == count_shards(target_placements[:k], tgt) and count_shards(current_placements[k + 1:], tgt) == 0:
+                if tgt.is_shard():
+                    tgt = cast(Shard, tgt)
+                    if to_shard(k, tgt):
+                        transform_infos.append(
+                            _TransformInfo(
+                                mesh_dim=k,
+                                src_dst_placements=(cur, tgt),
+                                logical_shape=mesh_dims_to_logical_shape[k],
+                            )
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+                elif tgt.is_partial():
+                    tgt = cast(Partial, tgt)
                     transform_infos.append(
                         _TransformInfo(
                             mesh_dim=k,
@@ -632,23 +651,50 @@ def _gen_immediate_transform_infos(
                             logical_shape=mesh_dims_to_logical_shape[k],
                         )
                     )
-                    current_placements[k] = tgt
-
-    # pass 2: from right to left
-    for k in range(len(current_placements) - 1, -1, -1):
-        cur = current_placements[k]
-        tgt = target_placements[k]
-
-        if cur.is_shard():
-            cur = cast(Shard, cur)
-            if tgt.is_replicate() or tgt.is_partial():
+                    cur_placements[k] = tgt
+                    immediate_transform_cnt += 1
+            elif cur.is_shard():
+                cur = cast(Shard, cur)
                 if tgt.is_replicate():
                     tgt = cast(Replicate, tgt)
-                else:
-                    assert tgt.is_partial()
+                    if from_shard(k, cur):
+                        transform_infos.append(
+                            _TransformInfo(
+                                mesh_dim=k,
+                                src_dst_placements=(cur, tgt),
+                                logical_shape=mesh_dims_to_logical_shape[k],
+                            )
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+                elif tgt.is_shard():
+                    tgt = cast(Shard, tgt)
+                    if cur.dim != tgt.dim and from_shard(k, cur) and to_shard(k, tgt):
+                        transform_infos.append(
+                            _TransformInfo(
+                                mesh_dim=k,
+                                src_dst_placements=(cur, tgt),
+                                logical_shape=mesh_dims_to_logical_shape[k],
+                            )
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+                elif tgt.is_partial():
                     tgt = cast(Partial, tgt)
-
-                if count_shards(current_placements[k + 1:], cur) == 0:
+                    if from_shard(k, cur):
+                        transform_infos.append(
+                            _TransformInfo(
+                                mesh_dim=k,
+                                src_dst_placements=(cur, tgt),
+                                logical_shape=mesh_dims_to_logical_shape[k],
+                            )
+                        )
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+            else:
+                cur = cast(Partial, cur)
+                if tgt.is_replicate():
+                    tgt = cast(Replicate, tgt)
                     transform_infos.append(
                         _TransformInfo(
                             mesh_dim=k,
@@ -656,56 +702,41 @@ def _gen_immediate_transform_infos(
                             logical_shape=mesh_dims_to_logical_shape[k],
                         )
                     )
-                    current_placements[k] = tgt
-
-    # pass 3: handle all other scenarios
-    for k in range(len(current_placements) - 1, -1, -1):
-        cur = current_placements[k]
-        tgt = target_placements[k]
-        if cur == tgt:
-            continue
-
-        if cur.is_shard() and tgt.is_shard():
-            cur = cast(Shard, cur)
-            tgt = cast(Shard, tgt)
-            if cur.dim != tgt.dim:
-                if (
-                    count_shards(current_placements[k + 1:], cur) == 0 \
-                    and count_shards(current_placements[:k], tgt) == count_shards(target_placements[:k], tgt) and count_shards(current_placements[k + 1:], tgt) == 0
-                ):
-                    transform_infos.append(
-                        _TransformInfo(
-                            mesh_dim=k,
-                            src_dst_placements=(cur, tgt),
-                            logical_shape=mesh_dims_to_logical_shape[k],
+                    cur_placements[k] = tgt
+                    immediate_transform_cnt += 1
+                elif tgt.is_shard():
+                    tgt = cast(Shard, tgt)
+                    if to_shard(k, tgt):
+                        transform_infos.append(
+                            _TransformInfo(
+                                mesh_dim=k,
+                                src_dst_placements=(cur, tgt),
+                                logical_shape=mesh_dims_to_logical_shape[k],
+                            )
                         )
-                    )
-                    current_placements[k] = tgt
-        elif cur.is_replicate() and tgt.is_partial():
-            cur = cast(Replicate, cur)
-            tgt = cast(Partial, tgt)
-            transform_infos.append(
+                        cur_placements[k] = tgt
+                        immediate_transform_cnt += 1
+
+        if immediate_transform_cnt > max_immediate_transform_cnt:
+            max_immediate_transform_cnt = immediate_transform_cnt
+            best_transform_infos = transform_infos
+            best_cur_placements = cur_placements
+
+    # transform rest P -> S to R -> S since P2P cannot handle reduce_scatter
+    for k, (cur, tgt) in enumerate(zip(best_cur_placements, tgt_placements)):
+        if cur.is_partial() and tgt.is_shard():
+            cur = cast(Partial, cur)
+            tgt = Replicate()
+            best_transform_infos.append(
                 _TransformInfo(
                     mesh_dim=k,
                     src_dst_placements=(cur, tgt),
                     logical_shape=mesh_dims_to_logical_shape[k],
                 )
             )
-            current_placements[k] = tgt
-        elif cur.is_partial():
-            cur = cast(Partial, cur)
-            if tgt.is_shard() or tgt.is_replicate():
-                tgt = Replicate()
-                transform_infos.append(
-                    _TransformInfo(
-                        mesh_dim=k,
-                        src_dst_placements=(cur, tgt),
-                        logical_shape=mesh_dims_to_logical_shape[k],
-                    )
-                )
-                current_placements[k] = tgt
+            best_cur_placements[k] = tgt
 
-    return transform_infos, DTensorSpec(src_spec.mesh, current_placements, src_spec.tensor_meta)
+    return best_transform_infos, DTensorSpec(src_spec.mesh, tuple(best_cur_placements), src_spec.tensor_meta)
 
 def redistribute_local_tensor_p2p(
     local_tensor: torch.Tensor,
@@ -734,6 +765,9 @@ def redistribute_local_tensor_p2p(
         return local_tensor
 
     transform_infos, current_spec = _gen_immediate_transform_infos(current_spec, target_spec)
+
+    # if dist.get_rank() == 0:
+    #     print("p2p", transform_infos)
 
     for transform_info in transform_infos:
         i = transform_info.mesh_dim
