@@ -15,7 +15,7 @@ def compare(p2p, time):
         return '🟰'
     return '✅' if p2p < time else '❌'
 
-device_mesh = DeviceMesh('cuda', torch.arange(4).reshape(2, 2))
+device_mesh = DeviceMesh('cuda', torch.arange(16).reshape(4, 4))
 rank = dist.get_rank()
 WARMUP = 10
 RUN = 20
@@ -92,7 +92,7 @@ if __name__ == "__main__":
         plt.xlabel(f'size {size_base.tolist()} * n')
         plt.ylabel('time (s)')
         plt.title(f"[Shard(0), Shard(1)] -> [Shard(1), Shard(0)] on {device_mesh.mesh.shape} mesh")
-        plt.savefig('case1.png')
+        plt.savefig('case1_16_gpus.png')
 
     p2p_time_list = []
     rule_time_list = []
@@ -110,5 +110,5 @@ if __name__ == "__main__":
         plt.xlabel(f'size {size_base.tolist()} * n')
         plt.ylabel('time (s)')
         plt.title(f"[Shard(0), Shard(0)] -> [Shard(1), Shard(1)] on {device_mesh.mesh.shape} mesh")
-        plt.savefig('case2.png')
+        plt.savefig('case2_16_gpus.png')
 

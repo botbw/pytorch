@@ -493,10 +493,12 @@ class Partition:
 
                 if rank == send_rank:
                     src_slice = tuple(slice(st - base, en - base) for base, st, en in zip(local_src_partition.start_coord, intersection.start_coord, intersection.end_coord))
+                    # TODO: possible to eliminate contiguous call to reduce mem usage?
                     send_ops.append(dist.P2POp(dist.isend, src_tensor[src_slice].contiguous(), recv_rank))
 
                 if rank == recv_rank:
                     tgt_slice = tuple(slice(st - base, en - base) for base, st, en in zip(local_dst_partition.start_coord, intersection.start_coord, intersection.end_coord))
+                    # TODO: possible to eliminate contiguous call to reduce mem usage?
                     recv_ops.append(dist.P2POp(dist.irecv, recv_buffer[tgt_slice].contiguous(), send_rank))
                     recv_slices.append(tgt_slice)
 
@@ -518,25 +520,6 @@ class Partition:
 
         return recv_buffer
 
-def _replicate_then_shard(val: _TransformInfo) -> int:
-    """
-    This is a helper function to allow reordering _TransformInfo list. The high level
-    idea is that we want to reorder the sharding redistributions so that the DTensor
-    redistribution is consistent with its full tensor. This is built on top of two simple
-    assumptions:
-    1. Replication happens from inner to outer dimension. i.e. Shard -> Replicate
-    2. Sharding happens from outer to inner dimension, i.e. Replicate -> Shard
-
-    So we always put the replication first and put sharding later.
-    """
-    mesh_dim = val.mesh_dim
-    src, dst = val.src_dst_placements
-    if (dst.is_replicate() or dst.is_partial()) and src.is_shard():
-        return -mesh_dim
-    elif (src.is_replicate() or src.is_partial()) and dst.is_shard():
-        return mesh_dim
-    else:
-        return 0
 
 @lru_cache(maxsize=None)
 def _gen_immediate_transform_infos(
@@ -765,9 +748,6 @@ def redistribute_local_tensor_p2p(
         return local_tensor
 
     transform_infos, current_spec = _gen_immediate_transform_infos(current_spec, target_spec)
-
-    # if dist.get_rank() == 0:
-    #     print("p2p", transform_infos)
 
     for transform_info in transform_infos:
         i = transform_info.mesh_dim
